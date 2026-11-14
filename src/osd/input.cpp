@@ -1832,6 +1832,7 @@ void Input::gather_lightguns(hw::Inputs* inputs, const rom::GameSpec& game) cons
         }
     }
     const bool positional = pos_gun_ch[0] >= 0 || pos_gun_ch[1] >= 0;
+    const bool handheld = positional && game.gun_handheld;
 
     if (!spec.present && !positional) {
         m_gun_aims[0].active = false;
@@ -2128,8 +2129,8 @@ void Input::gather_lightguns(hw::Inputs* inputs, const rom::GameSpec& game) cons
     // Record the aim (before the reload snap) for the crosshair overlay. Player 2's
     // shows only when a second gun or pad aims it.
     const bool p2_active = on_gun[1] || pad_for(1) != nullptr;
-    // Positional-gun titles draw their own crosshair. `side` is how far the
-    // widescreen picture reaches past the screen, as a fraction of its width.
+    // `side` is how far the widescreen picture reaches past the screen, as a
+    // fraction of its width.
     const float side = static_cast<float>(m_wide_columns) / static_cast<float>(render::kNativeWidth);
     const auto record = [side](bool active, bool mouse, const GunInput& g) {
         return GunAim{active, mouse, std::clamp(g.x, -side, 1.0f + side),
@@ -2151,15 +2152,16 @@ void Input::gather_lightguns(hw::Inputs* inputs, const rom::GameSpec& game) cons
         }
         return !m_gun_used[player] || now - m_gun_last_use_ms[player] > kIdleMs;
     };
-    m_gun_aims[0] = record(!positional, on_mouse[0], p1);
-    m_gun_aims[1] = record(p2_active && !positional, on_mouse[1], p2);
+    const bool sight = !positional || handheld;
+    m_gun_aims[0] = record(sight, on_mouse[0], p1);
+    m_gun_aims[1] = record(p2_active && sight, on_mouse[1], p2);
     m_gun_aims[0].idle = idle(0, p1);
     m_gun_aims[1].idle = idle(1, p2);
 
     if (positional) {
         // Positional gun: scale the aim into each channel's calibrated travel,
-        // overriding the stick. No off-screen reload. X reaches into the widescreen
-        // columns as far as the 8-bit value allows.
+        // overriding the stick. X reaches into the widescreen columns as far as
+        // the 8-bit value allows.
         const auto write_channel = [&](int idx, float fraction, float reach) {
             if (idx < 0) {
                 return;
@@ -2191,6 +2193,17 @@ void Input::gather_lightguns(hw::Inputs* inputs, const rom::GameSpec& game) cons
         write_channel(pos_gun_ch[1], p1.y, 0.0f);
         write_channel(pos_gun_ch[2], p2.x, side);
         write_channel(pos_gun_ch[3], p2.y, 0.0f);
+
+        // FRAME OUT: bit 1 drops while the gun is off screen.
+        if (handheld) {
+            constexpr float kEdge      = 0.01f;
+            const auto      off_screen = [side](const GunInput& g) {
+                return g.x < -side + kEdge || g.x > 1.0f + side - kEdge || g.y < kEdge
+                    || g.y > 1.0f - kEdge;
+            };
+            if (p1.reload || off_screen(p1)) inputs->in1 &= static_cast<u8>(~kButton2);
+            if (p2.reload || off_screen(p2)) inputs->in2 &= static_cast<u8>(~kButton2);
+        }
     } else {
         // X across the whole picture, which in widescreen reaches past the
         // screen; the X axes' travel grows to match.

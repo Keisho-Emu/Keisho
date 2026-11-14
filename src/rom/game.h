@@ -468,6 +468,9 @@ struct GameSpec {
     /// Lines: IN1 bits 0x10/0x20) rather than an off-screen reload.
     bool gun_missile = false;
 
+    /// Hand-held positional gun: Keisho's crosshair, off-screen on bit 1.
+    bool gun_handheld = false;
+
     /// True when the title will not start until its motion base answers on the
     /// I/O controller's ports D and E (Rail Chase 2). Acknowledged as MAME does.
     bool motion_base = false;
