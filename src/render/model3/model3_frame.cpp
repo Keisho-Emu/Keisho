@@ -171,10 +171,18 @@ void FrameBuilder::build(const hw::model3::VideoFrame& frame, bool encode_depth)
     // it never flips; 3D must last kSettle frames, or a one-frame pass over
     // a 2D screen (Ocean Hunter's logo) blinks it wide.
     constexpr u32 kSettle = 8;
-    m_frames_3d           = m_plan.passes.empty() ? 0 : std::min(m_frames_3d + 1, kSettle);
+    const bool drawn_3d   = !m_plan.passes.empty() && !m_plan.draws.empty();
+    m_frames_3d           = drawn_3d ? std::min(m_frames_3d + 1, kSettle) : 0;
     const bool screen_2d  = m_frames_3d < kSettle && !m_plan.los_active();
     if (screen_2d) {
         m_plan.widened = false;
+    }
+    // A white flash or fog with no 3D under it belongs to the 2D screen
+    // (Lost World's copyright): it keeps to the 4:3 box as well.
+    if (!drawn_3d && !m_plan.los_active() && g.wide_screen()) {
+        PixelRect& d = m_plan.display;
+        d.x          = static_cast<s32>(g.x_offset()) + d.y;
+        d.width      = static_cast<s32>(g.x_res()) - 2 * d.y;
     }
     plan_layers(screen_2d);
     if (m_replacements != nullptr && !m_replacements->empty()) {
