@@ -377,6 +377,18 @@ void TileGen::draw_sides(int line, std::span<const u32> regs, int primary, int l
     }
 }
 
+void TileGen::clear_sides()
+{
+    const usize width = wide_width();
+    for (auto& w : m_wide) {
+        for (usize y = 0; y < kHeight; y++) {
+            u32* const row = w.data() + y * width;
+            std::fill(row, row + m_side, 0u);
+            std::fill(row + m_side + kVisibleWidth, row + width, 0u);
+        }
+    }
+}
+
 void TileGen::keep_scrolled_sides()
 {
     const usize width = wide_width();

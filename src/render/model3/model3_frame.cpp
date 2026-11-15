@@ -161,12 +161,22 @@ void FrameBuilder::build(const hw::model3::VideoFrame& frame, bool encode_depth)
     // An opaque top layer hides the 3D (Le Mans 24's boot screen draws a full
     // scene under it, Scud Race's a white flash); skip it unless line-of-sight
     // still needs the depth.
-    if (!m_plan.los_active() && top_layer_hides_3d()) {
+    const bool hidden = !m_plan.los_active() && top_layer_hides_3d();
+    if (hidden) {
         m_plan.passes.clear();
         m_plan.fogs.clear();
         m_plan.white_flash = false;
     }
-    plan_layers();
+    // With no 3D drawn the frame is 2D-only, and stays 4:3 in widescreen so
+    // it never flips; 3D must last kSettle frames, or a one-frame pass over
+    // a 2D screen (Ocean Hunter's logo) blinks it wide.
+    constexpr u32 kSettle = 8;
+    m_frames_3d           = m_plan.passes.empty() ? 0 : std::min(m_frames_3d + 1, kSettle);
+    const bool screen_2d  = m_frames_3d < kSettle && !m_plan.los_active();
+    if (screen_2d) {
+        m_plan.widened = false;
+    }
+    plan_layers(screen_2d);
     if (m_replacements != nullptr && !m_replacements->empty()) {
         apply_replacements();
     }
@@ -233,7 +243,7 @@ std::span<const u32> FrameBuilder::layer(int index) const
     return m_tilegen.side_columns() != 0 ? m_tilegen.wide_layer(index) : m_tilegen.layer(index);
 }
 
-void FrameBuilder::plan_layers()
+void FrameBuilder::plan_layers(bool screen_2d)
 {
     const SceneGeometry& g = m_scene.geometry();
     for (int i = 0; i < 2; i++) {
@@ -247,8 +257,11 @@ void FrameBuilder::plan_layers()
     if (side == 0) {
         return;
     }
-    // With no 3D reaching the side columns, only a scrolling background fills them.
-    if (!m_plan.widened) {
+    // A 2D-only frame is pillarboxed; with 3D that stays inside the 4:3
+    // screen, only a scrolling background fills the side columns.
+    if (screen_2d) {
+        m_tilegen.clear_sides();
+    } else if (!m_plan.widened) {
         m_tilegen.keep_scrolled_sides();
     }
     const u32 width = m_tilegen.wide_width();

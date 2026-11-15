@@ -67,6 +67,8 @@ public:
     void finish_wide();
     /// Clears the sides of all but the lines a scrolling layer filled.
     void keep_scrolled_sides();
+    /// Clears the sides of both layers: a 2D-only screen stays 4:3.
+    void clear_sides();
     void reset_scroll();
 
 private:
