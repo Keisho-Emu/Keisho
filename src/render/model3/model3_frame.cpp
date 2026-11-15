@@ -140,6 +140,7 @@ void FrameBuilder::build(const hw::model3::VideoFrame& frame, bool encode_depth)
     const SceneGeometry& g = m_scene.geometry();
     m_tilegen.set_side_columns(g.columns);
     m_tilegen.set_extend(g.wide_2d && g.widen);
+    m_tilegen.set_stretch(g.stretch_2d && g.widen);
     m_tilegen.draw_frame(frame.tilegen_vram, frame.tilegen_regs, frame.tilegen_lines, frame.tilegen_writes);
     m_tilegen.finish_wide();
     m_times.tilegen = since(mark);

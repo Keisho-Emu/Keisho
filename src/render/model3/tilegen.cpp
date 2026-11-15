@@ -238,9 +238,11 @@ void TileGen::finish_wide()
             if (!backdrop[y]) {
                 std::fill(row, row + side, 0u);
                 std::fill(row + side + right, row + width, 0u);
+            } else if (l == 0 && m_stretch) {
+                stretch_row(centre, row);
             }
         }
-        if (!m_extend) {
+        if (!m_extend || (l == 0 && m_stretch)) {
             continue;
         }
         const auto edge_flat = [&](int edge) {
@@ -288,6 +290,27 @@ void TileGen::finish_wide()
                 }
             }
         }
+    }
+}
+
+// The 496 columns resampled across wide_width(), blending neighbours linearly.
+void TileGen::stretch_row(const u32* centre, u32* row) const
+{
+    const u32 width = wide_width();
+    const u32 step  = ((kVisibleWidth - 1) << 16) / (width - 1);
+    for (u32 x = 0; x < width; x++) {
+        const u32 pos  = x * step;
+        const u32 i    = std::min(pos >> 16, kVisibleWidth - 2);
+        const u32 frac = (pos >> 8) & 0xFF;
+        const u32 a    = centre[i];
+        const u32 b    = centre[i + 1];
+        u32       out  = a & 0xFF000000u;
+        for (u32 shift = 0; shift < 24; shift += 8) {
+            const u32 ca = (a >> shift) & 0xFF;
+            const u32 cb = (b >> shift) & 0xFF;
+            out |= ((ca * (256 - frac) + cb * frac) >> 8) << shift;
+        }
+        row[x] = out;
     }
 }
 
