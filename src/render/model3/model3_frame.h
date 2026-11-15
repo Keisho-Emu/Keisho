@@ -117,7 +117,7 @@ private:
     bool m_has_frame      = false;
     u64  m_frame_number   = 0;
     u64  m_builds         = 0;
-    u32  m_frames_3d      = 0;  // consecutive frames with 3D drawn
+    u32  m_frames_3d      = 0;
 
     const hw::model3::VideoFrame* m_last = nullptr;
     BuildTimes                    m_times;

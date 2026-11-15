@@ -167,9 +167,7 @@ void FrameBuilder::build(const hw::model3::VideoFrame& frame, bool encode_depth)
         m_plan.fogs.clear();
         m_plan.white_flash = false;
     }
-    // With no 3D drawn the frame is 2D-only, and stays 4:3 in widescreen so
-    // it never flips; 3D must last kSettle frames, or a one-frame pass over
-    // a 2D screen (Ocean Hunter's logo) blinks it wide.
+    // 2D-only frames stay 4:3; 3D must last a few frames to widen them.
     constexpr u32 kSettle = 8;
     const bool drawn_3d   = !m_plan.passes.empty() && !m_plan.draws.empty();
     m_frames_3d           = drawn_3d ? std::min(m_frames_3d + 1, kSettle) : 0;
@@ -177,8 +175,7 @@ void FrameBuilder::build(const hw::model3::VideoFrame& frame, bool encode_depth)
     if (screen_2d) {
         m_plan.widened = false;
     }
-    // A white flash or fog with no 3D under it belongs to the 2D screen
-    // (Lost World's copyright): it keeps to the 4:3 box as well.
+    // A flash with no 3D stays 4:3 too.
     if (!drawn_3d && !m_plan.los_active() && g.wide_screen()) {
         PixelRect& d = m_plan.display;
         d.x          = static_cast<s32>(g.x_offset()) + d.y;
@@ -265,8 +262,7 @@ void FrameBuilder::plan_layers(bool screen_2d)
     if (side == 0) {
         return;
     }
-    // A 2D-only frame is pillarboxed; with 3D that stays inside the 4:3
-    // screen, only a scrolling background fills the side columns.
+    // 2D-only frames are pillarboxed.
     if (screen_2d) {
         m_tilegen.clear_sides();
     } else if (!m_plan.widened) {

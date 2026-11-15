@@ -293,7 +293,6 @@ void TileGen::finish_wide()
     }
 }
 
-// The 496 columns resampled across wide_width(), blending neighbours linearly.
 void TileGen::stretch_row(const u32* centre, u32* row) const
 {
     const u32 width = wide_width();

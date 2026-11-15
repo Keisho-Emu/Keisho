@@ -58,7 +58,6 @@ public:
     /// Also carries a layer's rows out when its edges are one colour all the
     /// way down (a sky gradient, a frame).
     void set_extend(bool extend) { m_extend = extend; }
-    /// Stretches the bottom layer's full rows across wide_width() instead.
     void set_stretch(bool stretch) { m_stretch = stretch; }
 
     /// A layer wide_width() across: the sides, then the 496 columns of
@@ -67,7 +66,6 @@ public:
     void finish_wide();
     /// Clears the sides of all but the lines a scrolling layer filled.
     void keep_scrolled_sides();
-    /// Clears the sides of both layers: a 2D-only screen stays 4:3.
     void clear_sides();
     void reset_scroll();
 
