@@ -79,6 +79,10 @@
 #include <string_view>
 #include <vector>
 
+#if defined(_WIN32)
+#  include <windows.h>
+#endif
+
 #if !defined(SM2_HAVE_VULKAN)
 // enumerate_render_devices() is Vulkan-only; a Vulkan-less build lists none.
 namespace sm2::render {
@@ -268,8 +272,44 @@ struct Options {
     /// Also write --profile's per-stage table to this CSV file, one row per stage.
     std::string profile_csv;
 
+    /// Log file path (empty = keisho.log beside keisho.ini on Windows).
+    std::string log_file;
+
     bool     log_unmapped = false;
 };
+
+#if defined(_WIN32)
+void attach_windows_console()
+{
+    // Keep redirected handles intact; attach parent console otherwise.
+    const HANDLE out_handle = GetStdHandle(STD_OUTPUT_HANDLE);
+    const HANDLE err_handle = GetStdHandle(STD_ERROR_HANDLE);
+    const bool   has_out    = out_handle != nullptr && out_handle != INVALID_HANDLE_VALUE
+                           && GetFileType(out_handle) != FILE_TYPE_UNKNOWN;
+    const bool   has_err    = err_handle != nullptr && err_handle != INVALID_HANDLE_VALUE
+                           && GetFileType(err_handle) != FILE_TYPE_UNKNOWN;
+    if (has_out && has_err) {
+        return;
+    }
+    if (!AttachConsole(ATTACH_PARENT_PROCESS)) {
+        return;
+    }
+    if (!has_out) {
+        std::FILE* stream = nullptr;
+        static_cast<void>(freopen_s(&stream, "CONOUT$", "w", stdout));
+    }
+    if (!has_err) {
+        std::FILE* stream = nullptr;
+        static_cast<void>(freopen_s(&stream, "CONOUT$", "w", stderr));
+    }
+    const HANDLE in_handle = GetStdHandle(STD_INPUT_HANDLE);
+    if (in_handle == nullptr || in_handle == INVALID_HANDLE_VALUE
+        || GetFileType(in_handle) == FILE_TYPE_UNKNOWN) {
+        std::FILE* stream = nullptr;
+        static_cast<void>(freopen_s(&stream, "CONIN$", "r", stdin));
+    }
+}
+#endif
 
 void print_usage()
 {
@@ -300,6 +340,8 @@ void print_usage()
         "                      player each would drive\n"
         "      --list-games    List the games in the ROM database\n"
         "      --list-gpus     List the Vulkan devices that could be used\n"
+        "      --log-file <file> Write diagnostic logs to this file (on Windows,\n"
+        "                      defaults to keisho.log beside keisho.ini)\n"
         "      --log-level <l> trace, debug, info, warning or error\n"
         "      --no-vsync      Present without waiting for vertical blank\n"
         "      --nvram <dir>   Directory for saves: NVRAM and EEPROM images\n"
@@ -546,6 +588,8 @@ void print_usage()
             // handled
         } else if (takes_value("--gpu", &out->config.gpu)) {
             out->given.gpu = true;
+        } else if (takes_value("--log-file", &out->log_file)) {
+            // handled
         } else if (takes_value("--log-level", &out->config.log_level)) {
             sm2::log::Level parsed = sm2::log::Level::Info;
             if (!sm2::parse_log_level(out->config.log_level, &parsed)) {
@@ -882,6 +926,10 @@ int main(int argc, char** argv)
 {
     using namespace sm2;
 
+#if defined(_WIN32)
+    attach_windows_console();
+#endif
+
     Options options;
     if (!parse_command_line(argc, argv, &options)) {
         print_usage();
@@ -924,6 +972,36 @@ int main(int argc, char** argv)
     // --config names a directory; the file within it is keisho.ini.
     const std::string config_path =
         options.config_path.empty() ? default_config_path() : config_file_in(options.config_path);
+    const bool config_in_cwd =
+        options.config_path.empty() && std::filesystem::path(config_path).parent_path().empty();
+    const std::string config_dir =
+        std::filesystem::path(config_path).parent_path().string();
+
+    // Open early so keisho.ini parse warnings reach the log file.
+    log::Level level = log::Level::Info;
+    (void)parse_log_level(options.config.log_level, &level);
+    log::set_level(level);
+
+    const bool  cli_query       = options.list_gpus || options.list_gamepads || options.list_games;
+    std::string active_log_file = options.log_file;
+#if defined(_WIN32)
+    if (active_log_file.empty() && !cli_query) {
+        active_log_file = (config_dir.empty()
+                               ? std::filesystem::path("keisho.log")
+                               : (std::filesystem::path(config_dir) / "keisho.log"))
+                              .string();
+    }
+#endif
+    if (!active_log_file.empty()) {
+        std::error_code error;
+        const std::filesystem::path log_parent = std::filesystem::path(active_log_file).parent_path();
+        if (!log_parent.empty()) {
+            std::filesystem::create_directories(log_parent, error);
+        }
+        if (log::set_log_file(active_log_file)) {
+            std::atexit(&log::close_log_file);
+        }
+    }
 
     Config                   from_file = defaults;
     std::vector<std::string> problems;
@@ -1090,13 +1168,8 @@ int main(int argc, char** argv)
 
     // Default saves and screenshots go under the platform data dir, or stay
     // relative for an ini in the working directory. Artwork goes beside the ini.
-    const bool config_in_cwd =
-        options.config_path.empty() && std::filesystem::path(config_path).parent_path().empty();
-    const std::string config_dir =
-        std::filesystem::path(config_path).parent_path().string();
     resolve_default_paths(&options.config, config_in_cwd, config_dir);
 
-    log::Level level = log::Level::Info;
     (void)parse_log_level(options.config.log_level, &level);
     log::set_level(level);
 

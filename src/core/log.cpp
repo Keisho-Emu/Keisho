@@ -104,7 +104,7 @@ void write(Level level, const char* fmt, ...)
     std::fprintf(stderr, "[%s] %s\n", level_tag(level), buffer);
     if (g_file != nullptr) {
         std::fprintf(g_file, "[%s] %s\n", level_tag(level), buffer);
-        if (level >= Level::Warning) {
+        if (level >= Level::Info) {
             std::fflush(g_file);
         }
     }

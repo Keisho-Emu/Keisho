@@ -501,6 +501,11 @@ if(SM2_PLATFORM_MACOS)
     set_source_files_properties(${SM2_LANG_FONTS}
         PROPERTIES MACOSX_PACKAGE_LOCATION "Resources/lang/fonts")
 elseif(SM2_PLATFORM_WINDOWS)
+    # No console window on launch; keep int main().
+    if(MSVC)
+        set_target_properties(keisho PROPERTIES WIN32_EXECUTABLE TRUE)
+        target_link_options(keisho PRIVATE "/ENTRY:mainCRTStartup")
+    endif()
     # Compile the .ico into the .exe so Explorer and the taskbar show it. The
     # running window's icon is set in osd/window.cpp.
     set(SM2_WIN_ICON "${CMAKE_SOURCE_DIR}/data/icons/keisho.ico")
