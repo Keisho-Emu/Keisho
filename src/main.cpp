@@ -39,6 +39,9 @@
 #include "hw/model2_softrender.h"
 #include "hw/model2_softrender_async.h"
 #include "hw/rewind.h"
+#if defined(__ANDROID__)
+#  include "osd/android_platform.h"
+#endif
 #include "osd/app_menu.h"
 #include "hw/save_state_io.h"
 #include "osd/audio.h"
@@ -48,6 +51,7 @@
 #include "osd/i18n.h"
 #include "osd/input.h"
 #include "osd/scraper.h"
+#include "osd/touch_gamepad.h"
 #include "osd/window.h"
 #include "render/backend.h"
 #include "render/model3/soft_backend.h"
@@ -57,10 +61,17 @@
 #include "rom/game_db.h"
 #include "rom/rom_loader.h"
 
+#include <filesystem>
+#include <fstream>
 #include <map>
 #include <memory>
+#include <unordered_map>
+#include <unordered_set>
 
 #include <SDL3/SDL.h>
+#if defined(__ANDROID__)
+#  include <SDL3/SDL_main.h>
+#endif
 
 #include <imgui_impl_sdl3.h>
 
@@ -168,7 +179,9 @@ void apply_input_background(bool on)
 /// Default when --graphics-backend is not given: whichever GPU backend was
 /// compiled in, else software.
 constexpr GraphicsBackendChoice kDefaultGraphicsBackend =
-#if defined(SM2_HAVE_OPENGL_ES)
+#if defined(__ANDROID__) && defined(SM2_HAVE_VULKAN)
+    GraphicsBackendChoice::Vulkan;
+#elif defined(SM2_HAVE_OPENGL_ES)
     GraphicsBackendChoice::Opengl;
 #elif defined(SM2_HAVE_VULKAN)
     GraphicsBackendChoice::Vulkan;
@@ -195,10 +208,17 @@ struct Options {
         bool model2_rom_dir = false;
         bool model1_rom_dir = false;
         bool model3_rom_dir = false;
+        bool model1_artwork_dir = false;
+        bool model2_artwork_dir = false;
+        bool model3_artwork_dir = false;
+        bool model1_bezel_dir = false;
+        bool model2_bezel_dir = false;
+        bool model3_bezel_dir = false;
         bool nvram_dir  = false;
         bool screenshot_dir = false;
         bool render_scale = false;
         bool graphics_backend = false;
+        bool virtual_gamepad  = false;
     } given;
 
     bool        show_help  = false;
@@ -206,6 +226,7 @@ struct Options {
     bool        list_games = false;
     bool        list_gamepads = false;
     std::string config_path;
+    std::string filters_path;
     std::string game;
     std::string dump_roms;
     std::string dump_tilemap;
@@ -322,6 +343,7 @@ void print_usage()
         "  -h, --help          Show this message\n"
         "      --config <dir>  Directory holding keisho.ini, used for both\n"
         "                      reading and saving settings\n"
+        "      --filters <file> Path to filters.ini (Model 1/2/3 includes/excludes)\n"
         "      --dump-textures Write every 3D texture to <saves>/textures/<game>/dump\n"
         "      --fullscreen    Start filling the screen\n"
         "      --fullscreen-resolution <WxH>  Fullscreen at a lower mode the\n"
@@ -336,6 +358,9 @@ void print_usage()
         "      --lightgun, --no-lightgun  Gun mode (crosshair, hidden cursor) on\n"
         "                      in every game, or off; by default a gun game turns\n"
         "                      it on by itself\n"
+        "      --virtual-gamepad <auto|on|off>  On-screen touch controls: auto hides\n"
+        "                      when a physical gamepad or wheel is connected\n"
+        "      --no-virtual-gamepad  Alias for --virtual-gamepad off\n"
         "      --list-gamepads Show which gamepads were recognised and which\n"
         "                      player each would drive\n"
         "      --list-games    List the games in the ROM database\n"
@@ -356,6 +381,12 @@ void print_usage()
         "                      (--rom-dir is the older spelling)\n"
         "      --model3-rom-dir <dir>  Where the Model 3 archives live, if not\n"
         "                      in --model2-rom-dir\n"
+        "      --model1-artwork-dir <dir>  Local Model 1 cover images (<rom>.png/.jpg)\n"
+        "      --model2-artwork-dir <dir>  Local Model 2 cover images (<rom>.png/.jpg)\n"
+        "      --model3-artwork-dir <dir>  Local Model 3 cover images (<rom>.png/.jpg)\n"
+        "      --model1-bezel-dir <dir>    Local Model 1 bezel images (<game>.png/default.png)\n"
+        "      --model2-bezel-dir <dir>    Local Model 2 bezel images (<game>.png/default.png)\n"
+        "      --model3-bezel-dir <dir>    Local Model 3 bezel images (<game>.png/default.png)\n"
         "      --screenshot-dir <dir>  Where screenshots are written\n"
         "      --load-state <file>  Restore this save state before running, so a\n"
         "                      one-frame --screenshot captures that exact moment\n"
@@ -454,6 +485,20 @@ void print_usage()
         } else if (std::strcmp(arg, "--lightgun") == 0 || std::strcmp(arg, "--no-lightgun") == 0) {
             out->config.lightgun = arg[2] == 'n' ? sm2::Config::LightgunMode::Off : sm2::Config::LightgunMode::On;
             out->given.lightgun  = true;
+        } else if (std::strcmp(arg, "--no-virtual-gamepad") == 0) {
+            out->config.virtual_gamepad = sm2::Config::VirtualGamepadMode::Off;
+            out->given.virtual_gamepad  = true;
+        } else if (std::strcmp(arg, "--virtual-gamepad") == 0) {
+            if (index + 1 >= argc) {
+                SM2_ERROR("--virtual-gamepad requires a value (auto, on, off)");
+                return false;
+            }
+            if (!sm2::parse_virtual_gamepad_mode(argv[++index], &out->config.virtual_gamepad)) {
+                SM2_ERROR("--virtual-gamepad does not accept '%s' (valid: auto, on, off)",
+                          argv[index]);
+                return false;
+            }
+            out->given.virtual_gamepad = true;
         } else if (std::strcmp(arg, "--log-unmapped") == 0) {
             out->log_unmapped = true;
         } else if (std::strcmp(arg, "--boot-test") == 0) {
@@ -575,6 +620,18 @@ void print_usage()
             out->given.model2_rom_dir = true;
         } else if (takes_value("--model3-rom-dir", &out->config.model3_rom_dir)) {
             out->given.model3_rom_dir = true;
+        } else if (takes_value("--model1-artwork-dir", &out->config.model1_artwork_dir)) {
+            out->given.model1_artwork_dir = true;
+        } else if (takes_value("--model2-artwork-dir", &out->config.model2_artwork_dir)) {
+            out->given.model2_artwork_dir = true;
+        } else if (takes_value("--model3-artwork-dir", &out->config.model3_artwork_dir)) {
+            out->given.model3_artwork_dir = true;
+        } else if (takes_value("--model1-bezel-dir", &out->config.model1_bezel_dir)) {
+            out->given.model1_bezel_dir = true;
+        } else if (takes_value("--model2-bezel-dir", &out->config.model2_bezel_dir)) {
+            out->given.model2_bezel_dir = true;
+        } else if (takes_value("--model3-bezel-dir", &out->config.model3_bezel_dir)) {
+            out->given.model3_bezel_dir = true;
         } else if (takes_value("--nvram", &out->config.nvram_dir)) {
             out->given.nvram_dir = true;
         } else if (takes_value("--screenshot-dir", &out->config.screenshot_dir)) {
@@ -599,6 +656,8 @@ void print_usage()
             }
             out->given.log_level = true;
         } else if (takes_value("--config", &out->config_path)) {
+            // handled
+        } else if (takes_value("--filters", &out->filters_path)) {
             // handled
         } else if (takes_value("--game", &out->game)) {
             // handled
@@ -731,13 +790,20 @@ struct LoadedMachine {
     const sm2::hw::I8251* sound_link  = nullptr;
 };
 
-/// The folder set `name` loads from: model1_rom_dir / model3_rom_dir for a
-/// Model 1 / Model 3 set when one is given, else model2_rom_dir.
+/// Model-specific ROM folder for `name`, or empty.
 [[nodiscard]] const std::string& rom_dir_for(const sm2::rom::GameDatabase& database,
                                              const sm2::Config& config,
                                              const std::string& name)
 {
     const sm2::rom::GameSpec* game = database.find(name);
+#if defined(__ANDROID__)
+    if (game != nullptr && game->board == sm2::rom::Board::Model1) {
+        return config.model1_rom_dir;
+    }
+    if (game != nullptr && game->board == sm2::rom::Board::Model3) {
+        return config.model3_rom_dir;
+    }
+#else
     if (game != nullptr && game->board == sm2::rom::Board::Model1
         && !config.model1_rom_dir.empty()) {
         return config.model1_rom_dir;
@@ -746,6 +812,7 @@ struct LoadedMachine {
         && !config.model3_rom_dir.empty()) {
         return config.model3_rom_dir;
     }
+#endif
     return config.model2_rom_dir;
 }
 
@@ -769,6 +836,24 @@ struct LoadedMachine {
                 return candidate;
             }
         }
+        std::string low = stem;
+        std::transform(low.begin(), low.end(), low.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        std::error_code ec;
+        std::filesystem::directory_iterator it(
+            dir, std::filesystem::directory_options::skip_permission_denied, ec);
+        if (!ec) {
+            for (const auto& entry : it) {
+                std::error_code kind_ec;
+                if (!entry.is_regular_file(kind_ec) || kind_ec) continue;
+                std::string f = entry.path().filename().string();
+                std::transform(f.begin(), f.end(), f.begin(),
+                               [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                if (f == low + ".zip" || f == low + ".7z") {
+                    return entry.path();
+                }
+            }
+        }
         return std::nullopt;
     };
     if (std::optional<std::filesystem::path> own = archive_named(name)) {
@@ -778,10 +863,17 @@ struct LoadedMachine {
     if (game == nullptr || game->parent.empty()) {
         return std::nullopt;
     }
-    std::optional<std::filesystem::path> parent = archive_named(game->parent);
-    if (parent.has_value()
-        && sm2::rom::RomLoader::holds_clone(database, parent->string(), name)) {
-        return parent;
+    if (std::optional<std::filesystem::path> parent = archive_named(game->parent)) {
+#if defined(__ANDROID__)
+        const std::string dir_str = dir.string();
+        if (!sm2::osd::android_has_storage_access()
+            && dir_str.rfind("/storage/emulated/", 0) == 0) {
+            return std::nullopt;
+        }
+#endif
+        if (sm2::rom::RomLoader::holds_clone(database, parent->string(), name)) {
+            return parent;
+        }
     }
     return std::nullopt;
 }
@@ -915,10 +1007,17 @@ sm2::Config persisted_config(const sm2::Config& current, const Options& options,
     keep(g.model1_rom_dir, &Config::model1_rom_dir);
     keep(g.model2_rom_dir, &Config::model2_rom_dir);
     keep(g.model3_rom_dir, &Config::model3_rom_dir);
+    keep(g.model1_artwork_dir, &Config::model1_artwork_dir);
+    keep(g.model2_artwork_dir, &Config::model2_artwork_dir);
+    keep(g.model3_artwork_dir, &Config::model3_artwork_dir);
+    keep(g.model1_bezel_dir, &Config::model1_bezel_dir);
+    keep(g.model2_bezel_dir, &Config::model2_bezel_dir);
+    keep(g.model3_bezel_dir, &Config::model3_bezel_dir);
     keep(g.nvram_dir, &Config::nvram_dir);
     keep(g.screenshot_dir, &Config::screenshot_dir);
     keep(g.render_scale, &Config::render_scale);
     keep(g.graphics_backend, &Config::graphics_backend);
+    keep(g.virtual_gamepad, &Config::virtual_gamepad);
     return c;
 }
 
@@ -928,6 +1027,20 @@ int main(int argc, char** argv)
 
 #if defined(_WIN32)
     attach_windows_console();
+#endif
+#if defined(__ANDROID__)
+    SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
+    SDL_SetHint(SDL_HINT_RETURN_KEY_HIDES_IME, "1");
+    const std::string android_assets = osd::android_prepare_assets();
+    const std::string android_ext    = osd::android_external_root_dir();
+    const char*       android_int    = SDL_GetAndroidInternalStoragePath();
+    const std::string android_cfg =
+        !android_ext.empty() ? android_ext : (android_int != nullptr ? android_int : ".");
+    set_android_directories(android_cfg, android_cfg, android_assets);
+    if (!android_ext.empty()) {
+        std::error_code ec;
+        std::filesystem::create_directories(std::filesystem::path(android_ext) / "roms", ec);
+    }
 #endif
 
     Options options;
@@ -1036,6 +1149,24 @@ int main(int argc, char** argv)
     }
     if (!options.given.model3_rom_dir) {
         options.config.model3_rom_dir = from_file.model3_rom_dir;
+    }
+    if (!options.given.model1_artwork_dir) {
+        options.config.model1_artwork_dir = from_file.model1_artwork_dir;
+    }
+    if (!options.given.model2_artwork_dir) {
+        options.config.model2_artwork_dir = from_file.model2_artwork_dir;
+    }
+    if (!options.given.model3_artwork_dir) {
+        options.config.model3_artwork_dir = from_file.model3_artwork_dir;
+    }
+    if (!options.given.model1_bezel_dir) {
+        options.config.model1_bezel_dir = from_file.model1_bezel_dir;
+    }
+    if (!options.given.model2_bezel_dir) {
+        options.config.model2_bezel_dir = from_file.model2_bezel_dir;
+    }
+    if (!options.given.model3_bezel_dir) {
+        options.config.model3_bezel_dir = from_file.model3_bezel_dir;
     }
     if (!options.given.nvram_dir) {
         options.config.nvram_dir = from_file.nvram_dir;
@@ -1159,6 +1290,7 @@ int main(int argc, char** argv)
     options.config.lightgun_crosshair       = from_file.lightgun_crosshair;
     options.config.lightgun_hide_flash      = from_file.lightgun_hide_flash;
     options.config.lightgun_pad_centred     = from_file.lightgun_pad_centred;
+    options.config.lightgun_stick_sensitivity = from_file.lightgun_stick_sensitivity;
     options.config.lightgun_recoil          = from_file.lightgun_recoil;
     options.config.lightgun_recoil_strength = from_file.lightgun_recoil_strength;
     options.config.sinden_border            = from_file.sinden_border;
@@ -1166,9 +1298,23 @@ int main(int argc, char** argv)
     options.config.sinden_border_thickness  = from_file.sinden_border_thickness;
     options.config.gun_buttons              = from_file.gun_buttons;
 
+    if (!options.given.virtual_gamepad) {
+        options.config.virtual_gamepad = from_file.virtual_gamepad;
+    }
+    options.config.virtual_gamepad_opacity = from_file.virtual_gamepad_opacity;
+    options.config.virtual_gamepad_scale   = from_file.virtual_gamepad_scale;
+    options.config.touch_gun_aim           = from_file.touch_gun_aim;
+
     // Default saves and screenshots go under the platform data dir, or stay
     // relative for an ini in the working directory. Artwork goes beside the ini.
+    const std::string filters_path = !options.filters_path.empty()
+                                       ? options.filters_path
+                                       : filters_file_in(config_dir.empty() ? "." : config_dir);
     resolve_default_paths(&options.config, config_in_cwd, config_dir);
+    {
+        ModelFilters initial_filters;
+        static_cast<void>(load_or_create_filters(filters_path, &initial_filters));
+    }
 
     (void)parse_log_level(options.config.log_level, &level);
     log::set_level(level);
@@ -1258,16 +1404,22 @@ int main(int argc, char** argv)
     // --game with no path: the archive is found in its ROM folder once the
     // database is loaded (a clone may live in its parent's archive). A
     // positional path wins.
+    const bool launched_from_frontend = !options.rom_path.empty() || !options.game.empty();
     const bool any_rom_dir = !options.config.model2_rom_dir.empty()
                              || !options.config.model1_rom_dir.empty()
                              || !options.config.model3_rom_dir.empty();
     const bool game_in_rom_dir = options.rom_path.empty() && !options.game.empty()
                                  && any_rom_dir;
 
-    // Show the picker when launched with no ROM but a ROM folder to browse.
-    const bool will_show_picker = options.rom_path.empty() && options.game.empty()
+    // On Android, start in the picker even if folders are currently empty.
+#if defined(__ANDROID__)
+    const bool will_show_picker = !launched_from_frontend
+                                  && !options.list_games && options.boot_test == 0;
+#else
+    const bool will_show_picker = !launched_from_frontend
                                   && any_rom_dir
                                   && !options.list_games && options.boot_test == 0;
+#endif
 
     // As will_show_picker, but a ROM folder may be set later from the Paths tab,
     // whose rescan needs the database.
@@ -1306,6 +1458,9 @@ int main(int argc, char** argv)
         std::printf("%-12s %-14s %-34s %-6s %s\n",
                     "SET", "BOARD", "TITLE", "YEAR", "NOTES");
         for (const rom::GameSpec& game : database.games()) {
+            if (!rom::board_implemented(game.board)) {
+                continue;
+            }
             // Printed as written, without a "v" prefix: "2.1", but also
             // "Revision B".
             std::string notes = game.version;
@@ -1763,12 +1918,27 @@ int main(int argc, char** argv)
     }
 
     int exit_code = 0;
-    {
+    for (;;) {
+        bool relaunch_backend = false;
+        struct RendererKey {
+            std::string backend;
+            std::string gpu;
+            u32         scale = 1;
+            bool operator==(const RendererKey&) const = default;
+        };
+        const auto current_renderer_key = [&]() {
+            return RendererKey{options.config.graphics_backend, options.config.gpu,
+                               options.config.render_scale};
+        };
         osd::WindowConfig window_config;
         window_config.title      = std::string("Keisho ") + SM2_VERSION;
         window_config.width      = options.config.window_width;
         window_config.height     = options.config.window_height;
+#if defined(__ANDROID__)
+        window_config.fullscreen = true;
+#else
         window_config.fullscreen = options.config.fullscreen;
+#endif
         window_config.fullscreen_resolution = options.config.fullscreen_resolution;
 
         // Which GPU backend presents. `software` only replaces the drawing,
@@ -1872,15 +2042,26 @@ int main(int argc, char** argv)
         gui.set_config_path(config_path);
         gui.set_save_filter(to_save);
         gui.set_texture_backend(backend.get());
-        // The renderers this build offers, most-preferred first. Software only
-        // presents through a GPU backend, so it needs one present.
+        // Order matches kDefaultGraphicsBackend.
         {
             std::vector<std::string> renderers;
-#if defined(SM2_HAVE_VULKAN)
+#if defined(__ANDROID__)
+#  if defined(SM2_HAVE_VULKAN)
             renderers.emplace_back("vulkan");
-#endif
-#if defined(SM2_HAVE_OPENGL_DESKTOP) || defined(SM2_HAVE_OPENGL_ES)
+#  endif
+#  if defined(SM2_HAVE_OPENGL_ES) || defined(SM2_HAVE_OPENGL_DESKTOP)
             renderers.emplace_back("opengl");
+#  endif
+#else
+#  if defined(SM2_HAVE_OPENGL_ES)
+            renderers.emplace_back("opengl");
+#  endif
+#  if defined(SM2_HAVE_VULKAN)
+            renderers.emplace_back("vulkan");
+#  endif
+#  if defined(SM2_HAVE_OPENGL_DESKTOP)
+            renderers.emplace_back("opengl");
+#  endif
 #endif
             if (!renderers.empty()) {
                 renderers.emplace_back("software");
@@ -1896,6 +2077,9 @@ int main(int argc, char** argv)
             std::map<std::string, std::pair<bool, bool>> guns;
             std::map<std::string, osd::Gui::GameFamily>  uses;
             for (const rom::GameSpec& game : database.games()) {
+                if (!rom::board_implemented(game.board)) {
+                    continue;
+                }
                 const std::string family = game_family(game);
                 if (kNoVolume.count(family) != 0) {
                     continue;
@@ -2015,29 +2199,227 @@ int main(int argc, char** argv)
         // Build the picker's entry list from the launchable sets and turn it on.
         // Used at startup and when Esc unloads a game to return here.
         const auto show_picker = [&]() {
-            // A set is launchable when it has an archive in its ROM folder:
-            // its own <name>.zip / .7z, or, for a clone, its parent's merged one.
+            // One entry per matching .zip/.7z archive in each model's folder.
+            enum class SystemBucket { Model1, Model2, Model3 };
+            const auto matches_bucket = [](rom::Board b, SystemBucket bucket) -> bool {
+                switch (bucket) {
+                    case SystemBucket::Model1: return b == rom::Board::Model1;
+                    case SystemBucket::Model3: return b == rom::Board::Model3;
+                    case SystemBucket::Model2:
+                        return b == rom::Board::Model2 || b == rom::Board::Model2A
+                            || b == rom::Board::Model2B || b == rom::Board::Model2C;
+                }
+                return false;
+            };
+            const auto system_label = [](SystemBucket bucket) -> const char* {
+                switch (bucket) {
+                    case SystemBucket::Model1: return "Model 1";
+                    case SystemBucket::Model3: return "Model 3";
+                    case SystemBucket::Model2: return "Model 2";
+                }
+                return "Model 2";
+            };
+
             std::vector<osd::Gui::PickerEntry> entries;
             std::vector<osd::Scraper::Entry>   scrape_list;
-            for (const rom::GameSpec& game : database.games()) {
-                if (!find_set_archive(database, options.config, game.name).has_value()) {
-                    continue;
+
+            const auto build_cover_map = [](const std::string& cover_dir)
+                -> std::unordered_map<std::string, std::string> {
+                std::unordered_map<std::string, std::string> map;
+                if (cover_dir.empty()) {
+                    return map;
                 }
-                osd::Gui::PickerEntry entry;
-                entry.name   = game.name;
-                entry.title  = game.title;
-                entry.system = game.board == rom::Board::Model1 ? "Model 1"
-                             : game.board == rom::Board::Model3 ? "Model 3"
-                                                                : "Model 2";
-                entries.push_back(entry);
-                scrape_list.push_back({game.name, game.title});
-            }
+#if defined(__ANDROID__)
+                if (!sm2::osd::android_has_storage_access()
+                    && cover_dir.rfind("/storage/emulated/", 0) == 0) {
+                    return map;
+                }
+#endif
+                std::error_code ec;
+                std::filesystem::directory_iterator it(
+                    cover_dir, std::filesystem::directory_options::skip_permission_denied, ec);
+                if (ec) {
+                    return map;
+                }
+                const auto rank_ext = [](const std::string& ext) -> int {
+                    if (ext == ".png") return 5;
+                    if (ext == ".jpg") return 4;
+                    if (ext == ".jpeg") return 3;
+                    if (ext == ".bmp") return 2;
+                    if (ext == ".tga") return 1;
+                    return 0;
+                };
+                std::unordered_map<std::string, int> ranks;
+                for (const auto& dir_entry : it) {
+                    std::error_code kind_ec;
+                    if (!dir_entry.is_regular_file(kind_ec) || kind_ec) {
+                        continue;
+                    }
+                    std::string ext = dir_entry.path().extension().string();
+                    std::transform(ext.begin(), ext.end(), ext.begin(),
+                                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                    const int rank = rank_ext(ext);
+                    if (rank == 0) {
+                        continue;
+                    }
+                    std::string stem = dir_entry.path().stem().string();
+                    std::transform(stem.begin(), stem.end(), stem.begin(),
+                                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                    if (stem.empty()) {
+                        continue;
+                    }
+                    if (ranks[stem] < rank) {
+                        ranks[stem] = rank;
+                        map[stem]   = dir_entry.path().string();
+                    }
+                }
+                return map;
+            };
+
+            const auto load_stem_list = [](const std::string& dir_str, const char* filename)
+                -> std::unordered_set<std::string> {
+                std::unordered_set<std::string> stems;
+                const std::filesystem::path dir(dir_str);
+                for (const std::filesystem::path& cand : {dir / filename, dir.parent_path() / filename}) {
+                    std::error_code ec;
+                    if (!std::filesystem::is_regular_file(cand, ec) || ec) {
+                        continue;
+                    }
+                    std::ifstream in(cand);
+                    std::string   line;
+                    while (std::getline(in, line)) {
+                        const usize first = line.find_first_not_of(" \t\r\n");
+                        if (first == std::string::npos || line[first] == '#') {
+                            continue;
+                        }
+                        const usize last = line.find_last_not_of(" \t\r\n");
+                        std::string item = line.substr(first, last - first + 1);
+                        std::transform(item.begin(), item.end(), item.begin(),
+                                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                        if (item.size() > 4 && item.compare(item.size() - 4, 4, ".zip") == 0) {
+                            item.resize(item.size() - 4);
+                        } else if (item.size() > 3 && item.compare(item.size() - 3, 3, ".7z") == 0) {
+                            item.resize(item.size() - 3);
+                        }
+                        if (!item.empty()) {
+                            stems.insert(std::move(item));
+                        }
+                    }
+                }
+                return stems;
+            };
+
+            ModelFilters filters;
+            static_cast<void>(load_or_create_filters(filters_path, &filters));
+
+            const auto scan_bucket = [&](const std::string& dir_str, const std::string& cover_dir,
+                                         SystemBucket bucket) {
+                if (dir_str.empty()) {
+                    return;
+                }
+#if defined(__ANDROID__)
+                if (!sm2::osd::android_has_storage_access()
+                    && dir_str.rfind("/storage/emulated/", 0) == 0) {
+                    return;
+                }
+#endif
+                std::error_code ec;
+                std::filesystem::directory_iterator it(
+                    dir_str, std::filesystem::directory_options::skip_permission_denied, ec);
+                if (ec) {
+                    return;
+                }
+                const auto local_covers   = build_cover_map(cover_dir);
+                auto       excluded_stems = load_stem_list(dir_str, "exclude.txt");
+                auto       included_stems = load_stem_list(dir_str, "include.txt");
+                const auto& cfg_excl = bucket == SystemBucket::Model1 ? filters.model1_exclude
+                                     : bucket == SystemBucket::Model3 ? filters.model3_exclude
+                                                                      : filters.model2_exclude;
+                const auto& cfg_incl = bucket == SystemBucket::Model1 ? filters.model1_include
+                                     : bucket == SystemBucket::Model3 ? filters.model3_include
+                                                                      : filters.model2_include;
+                excluded_stems.insert(cfg_excl.begin(), cfg_excl.end());
+                included_stems.insert(cfg_incl.begin(), cfg_incl.end());
+                std::set<std::string> seen_stems;
+                for (const auto& dir_entry : it) {
+                    std::error_code kind_ec;
+                    if (!dir_entry.is_regular_file(kind_ec) || kind_ec) {
+                        continue;
+                    }
+                    std::string ext = dir_entry.path().extension().string();
+                    std::transform(ext.begin(), ext.end(), ext.begin(),
+                                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                    if (ext != ".zip" && ext != ".7z") {
+                        continue;
+                    }
+                    std::string stem = dir_entry.path().stem().string();
+                    std::transform(stem.begin(), stem.end(), stem.begin(),
+                                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                    if (stem.empty() || seen_stems.count(stem) != 0) {
+                        continue;
+                    }
+                    if (!included_stems.empty()) {
+                        if (included_stems.count(stem) == 0) {
+                            continue;
+                        }
+                    } else if (excluded_stems.count(stem) != 0) {
+                        continue;
+                    }
+                    const rom::GameSpec* match = database.find(stem);
+                    if (match != nullptr
+                        && (!rom::board_implemented(match->board) || !matches_bucket(match->board, bucket))) {
+                        match = nullptr;
+                    }
+                    if (match == nullptr) {
+                        for (const rom::GameSpec& candidate : database.games()) {
+                            if (candidate.parent == stem && rom::board_implemented(candidate.board)
+                                && matches_bucket(candidate.board, bucket)) {
+                                match = &candidate;
+                                break;
+                            }
+                        }
+                    }
+                    if (match == nullptr) {
+                        continue;
+                    }
+                    seen_stems.insert(stem);
+                    osd::Gui::PickerEntry entry;
+                    entry.name   = stem;
+                    entry.title  = match->title;
+                    entry.system = system_label(bucket);
+                    if (const auto cover_it = local_covers.find(stem); cover_it != local_covers.end()) {
+                        entry.local_art_paths.push_back(cover_it->second);
+                    }
+                    entries.push_back(entry);
+                    scrape_list.push_back({stem, match->title});
+                }
+            };
+
+#if defined(__ANDROID__)
+            scan_bucket(options.config.model1_rom_dir, options.config.model1_artwork_dir, SystemBucket::Model1);
+            scan_bucket(options.config.model2_rom_dir, options.config.model2_artwork_dir, SystemBucket::Model2);
+            scan_bucket(options.config.model3_rom_dir, options.config.model3_artwork_dir, SystemBucket::Model3);
+#else
+            const std::string& m1_dir = !options.config.model1_rom_dir.empty()
+                                          ? options.config.model1_rom_dir
+                                          : options.config.model2_rom_dir;
+            const std::string& m3_dir = !options.config.model3_rom_dir.empty()
+                                          ? options.config.model3_rom_dir
+                                          : options.config.model2_rom_dir;
+            scan_bucket(m1_dir, options.config.model1_artwork_dir, SystemBucket::Model1);
+            scan_bucket(options.config.model2_rom_dir, options.config.model2_artwork_dir, SystemBucket::Model2);
+            scan_bucket(m3_dir, options.config.model3_artwork_dir, SystemBucket::Model3);
+#endif
+
             std::sort(entries.begin(), entries.end(),
                       [](const osd::Gui::PickerEntry& a,
                          const osd::Gui::PickerEntry& b) { return a.title < b.title; });
 
-            SM2_INFO("game picker: %zu launchable set(s) in '%s'", entries.size(),
-                     options.config.model2_rom_dir.c_str());
+            SM2_INFO("game picker: %zu launchable set(s) (m1='%s', m2='%s', m3='%s')",
+                     entries.size(),
+                     options.config.model1_rom_dir.c_str(),
+                     options.config.model2_rom_dir.c_str(),
+                     options.config.model3_rom_dir.c_str());
 
             // stop() first so a second start() (return-to-picker) never
             // move-assigns over a still-joinable worker thread.
@@ -2063,7 +2445,13 @@ int main(int argc, char** argv)
             present_with_opengl ? std::vector<std::string>{} : render::enumerate_render_devices();
 
         // No gamepad is not fatal: the keyboard covers everything the cabinet has.
-        osd::Input input;
+        osd::Input        input;
+        osd::TouchGamepad touch_gamepad;
+        touch_gamepad.set_window(window.handle());
+        gui.set_picker_can_return(will_show_picker
+                                  || !options.config.model1_rom_dir.empty()
+                                  || !options.config.model2_rom_dir.empty()
+                                  || !options.config.model3_rom_dir.empty());
         bool input_background = options.config.input_background;
         apply_input_background(input_background);
         input.set_pad_devices(options.config.pad_device);
@@ -2246,14 +2634,26 @@ int main(int argc, char** argv)
         };
         std::optional<StateAction> state_action;
         bool settings_was_visible = gui.visible();  ///< Settings visibility, last frame.
+        bool rescan_on_foreground = false;
+        const RendererKey renderer_at_open = current_renderer_key();
         // What the game list is built from, as it was when the settings opened:
         // the list is rebuilt only when one of these changed there.
         const auto list_inputs = [&] {
-            return std::array<std::string, 4>{options.config.model2_rom_dir, options.config.model1_rom_dir,
+#if defined(__ANDROID__)
+            const std::string perm = osd::android_has_storage_access() ? "1" : "0";
+#else
+            const std::string perm;
+#endif
+            return std::array<std::string, 8>{options.config.model2_rom_dir,
+                                              options.config.model1_rom_dir,
                                               options.config.model3_rom_dir,
-                                              options.config.scrape_artwork ? "scrape" : ""};
+                                              options.config.model1_artwork_dir,
+                                              options.config.model2_artwork_dir,
+                                              options.config.model3_artwork_dir,
+                                              options.config.scrape_artwork ? "scrape" : "",
+                                              perm};
         };
-        std::array<std::string, 4> list_inputs_at_open = list_inputs();
+        std::array<std::string, 8> list_inputs_at_open = list_inputs();
         // Fixed at launch by --graphics-backend software.
         const bool use_software_renderer = options.start_in_software_renderer;
         // 16:9 widens the frame only on a GPU renderer; elsewhere it shows 4:3.
@@ -2313,9 +2713,9 @@ int main(int argc, char** argv)
         };
         window.set_title(build_title());
 
-        std::optional<render::TextureDumper> texture_dumper;
+        std::optional<render::TextureDumper>           texture_dumper;
         std::unique_ptr<render::model3::TextureDumper> model3_dumper;
-        std::string                          texture_dump_game;
+        std::string                                    texture_dump_game;
 
         // Custom textures for the running game; the backend holds a pointer,
         // so it is cleared there before this is replaced or freed.
@@ -2383,8 +2783,28 @@ int main(int argc, char** argv)
                 }
             }
 
+            const bool can_return_to_picker =
+                !launched_from_frontend
+                && (will_show_picker || !options.config.model2_rom_dir.empty()
+                    || !options.config.model1_rom_dir.empty()
+                    || !options.config.model3_rom_dir.empty());
+            gui.set_picker_can_return(can_return_to_picker);
+
+            const bool   in_game_touch    = machine_any != nullptr && !gui.visible() && !gui.load_error_open();
+            const bool   touch_pad_active = in_game_touch && osd::TouchGamepad::is_active(options.config, input);
+            int          touch_win_w = 0, touch_win_h = 0;
+            SDL_GetWindowSize(window.handle(), &touch_win_w, &touch_win_h);
+            const ImVec2 gui_disp = ImGui::GetIO().DisplaySize;
+            const float  touch_w  = gui_disp.x > 0.0f ? gui_disp.x : static_cast<float>(touch_win_w);
+            const float  touch_h  = gui_disp.y > 0.0f ? gui_disp.y : static_cast<float>(touch_win_h);
+
             SDL_Event event;
             while (SDL_PollEvent(&event)) {
+                if (in_game_touch
+                    && touch_gamepad.handle_event(event, touch_w, touch_h, options.config,
+                                                  gui.current_family_info(), touch_pad_active)) {
+                    continue;
+                }
                 // Let ImGui see every event, bar a key the System tab is
                 // binding, which its keyboard navigation would also press.
                 if (event.type != SDL_EVENT_KEY_DOWN || !gui.visible() || !gui.capturing_key()) {
@@ -2402,10 +2822,39 @@ int main(int argc, char** argv)
                     case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
                         running = false;
                         break;
+                    case SDL_EVENT_WILL_ENTER_BACKGROUND:
+                    case SDL_EVENT_DID_ENTER_BACKGROUND:
+                        touch_gamepad.reset(&input);
+                        if (!audio_paused_state) {
+                            audio.set_paused(true);
+                            audio_paused_state = true;
+                        }
+                        input.release_force_feedback();
+                        if (machine_any != nullptr) {
+                            machine_any->save_nvram();
+                        }
+                        static_cast<void>(save_config(config_path, to_save(options.config)));
+                        break;
+                    case SDL_EVENT_DID_ENTER_FOREGROUND:
+                        pacer.resync();
+#if defined(__ANDROID__)
+                        rescan_on_foreground = true;
+#endif
+                        break;
                     case SDL_EVENT_KEY_DOWN:
                         if (gui.visible() && gui.capturing_key()) {
                             // The System tab is binding a shortcut.
                             gui.capture_key(options.config, event.key.key);
+                        } else if (event.key.key == SDLK_AC_BACK && !event.key.repeat) {
+                            if (gui.load_error_open()) {
+                            } else if (gui.visible()) {
+                                gui.escape();
+                            } else if (machine_any != nullptr) {
+                                gui.show();
+                            } else if (gui.picker_escape()) {
+                            } else {
+                                running = false;
+                            }
                         } else if (event.key.key == SDLK_ESCAPE && gui.load_error_open()) {
                             // The dialog takes this Esc.
                         } else if (event.key.key == SDLK_ESCAPE && gui.visible() && !event.key.repeat) {
@@ -2416,7 +2865,7 @@ int main(int argc, char** argv)
                         } else if (is_hotkey(event.key, Config::Hotkey::Exit)) {
                             // Return to the game picker when there is one,
                             // otherwise quit. Serviced after the event loop.
-                            if (will_show_picker && machine_any != nullptr) {
+                            if (can_return_to_picker && machine_any != nullptr) {
                                 return_to_picker_requested = true;
                             } else {
                                 running = false;
@@ -2487,7 +2936,7 @@ int main(int argc, char** argv)
                 input.update_pad_shortcuts(options.config.pad_shortcuts);
             if (pad_shortcuts.exit) {
                 // As Esc: back to the games when there are some, else quit.
-                if (will_show_picker && machine_any != nullptr) {
+                if (can_return_to_picker && machine_any != nullptr) {
                     return_to_picker_requested = true;
                 } else {
                     running = false;
@@ -2647,6 +3096,7 @@ int main(int argc, char** argv)
                                  options.config.lightgun_recoil_strength);
                 input.set_gun_buttons(options.config.gun_buttons);
                 input.set_pad_aim_centred(options.config.lightgun_pad_centred);
+                input.set_pad_aim_sensitivity(options.config.lightgun_stick_sensitivity);
                 input.set_pad_layout(osd::Input::game_layout(options.config, game_family(loaded->game),
                                                              static_cast<u32>(loaded->game.inputs)));
                 input.set_pad_stick_sensitivity(options.config.pad_stick_sensitivity);
@@ -3115,6 +3565,10 @@ int main(int argc, char** argv)
                 gui.set_state_slots(machine_any != nullptr, {});
             }
             gui.set_current_game(loaded.has_value() ? loaded->game.name : std::string());
+            gui.set_current_system(!loaded.has_value()                        ? std::string()
+                                   : loaded->game.board == rom::Board::Model1 ? std::string("Model 1")
+                                   : loaded->game.board == rom::Board::Model3 ? std::string("Model 3")
+                                                                              : std::string("Model 2"));
             gui.set_model3_running(loaded.has_value() && loaded->game.board == rom::Board::Model3);
             gui.set_current_family(loaded.has_value() ? game_family(loaded->game)
                                                       : std::string());
@@ -3122,6 +3576,61 @@ int main(int argc, char** argv)
             const bool gui_active =
                 gui.draw(options.config, gpu_names, pacer.measured_hz(),
                         use_software_renderer ? "Software" : gpu_backend_name, &input);
+            const bool in_game_now = machine_any != nullptr && !gui.visible() && !gui.load_error_open();
+            const bool pad_now     = in_game_now && osd::TouchGamepad::is_active(options.config, input);
+            const bool show_touch_ui =
+                in_game_now && options.config.virtual_gamepad != Config::VirtualGamepadMode::Off && pad_now;
+            const ImVec2 now_disp = ImGui::GetIO().DisplaySize;
+            touch_gamepad.update_and_draw(
+                options.config, &input, gui.current_family_info(), show_touch_ui, pad_now,
+                now_disp.x > 0.0f ? now_disp.x : touch_w,
+                now_disp.y > 0.0f ? now_disp.y : touch_h, gui.ui_scale());
+            if (touch_gamepad.take_menu_request()) {
+                gui.show();
+                touch_gamepad.reset(&input);
+            }
+            if (touch_gamepad.take_fps_toggle_request()) {
+                options.config.show_fps = !options.config.show_fps;
+            }
+            if (touch_gamepad.take_exit_request()) {
+                if (can_return_to_picker) {
+                    return_to_picker_requested = true;
+                } else {
+                    running = false;
+                }
+            }
+            if (const osd::TouchGamepad::StateAction tsa = touch_gamepad.take_state_request();
+                tsa.kind != osd::TouchGamepad::StateAction::Kind::None) {
+                state_action = StateAction{
+                    tsa.kind == osd::TouchGamepad::StateAction::Kind::Save ? StateOp::Save : StateOp::Load,
+                    std::to_string(tsa.slot),
+                };
+            }
+            if (gui.take_return_to_picker_request()) {
+                return_to_picker_requested = true;
+            }
+            if ((gui.take_rescan_request() || rescan_on_foreground) && machine_any == nullptr) {
+                rescan_on_foreground = false;
+                show_picker();
+            }
+            rescan_on_foreground = false;
+            if (gui.take_quit_request()) {
+                running = false;
+            }
+#if defined(__ANDROID__)
+            {
+                const bool want_text = ImGui::GetIO().WantTextInput;
+                static bool text_input_active = false;
+                if (want_text != text_input_active) {
+                    text_input_active = want_text;
+                    if (want_text) {
+                        SDL_StartTextInput(window.handle());
+                    } else {
+                        SDL_StopTextInput(window.handle());
+                    }
+                }
+            }
+#endif
             // An overlay Save/Load/Delete button is serviced like the hotkeys.
             if (std::optional<osd::Gui::StateRequest> req = gui.take_pending_state_request()) {
                 using A  = osd::Gui::StateRequest::Action;
@@ -3132,21 +3641,37 @@ int main(int argc, char** argv)
             }
             // Apply a fullscreen toggle from the Settings menu at once.
             if (options.config.fullscreen != window.fullscreen()) {
+#if !defined(__ANDROID__)
                 window.set_fullscreen(options.config.fullscreen);
+#endif
             }
-            // Settings just opened: note the folders; just closed with no game
-            // loaded and a folder changed: rescan them.
             if (!settings_was_visible && gui.visible()) {
                 list_inputs_at_open = list_inputs();
             }
-            if (settings_was_visible && !gui.visible() && machine_any == nullptr
-                && list_inputs() != list_inputs_at_open) {
-                show_picker();
+            if (settings_was_visible && !gui.visible()) {
+                static_cast<void>(save_config(config_path, to_save(options.config)));
+                if (current_renderer_key() != renderer_at_open) {
+                    const std::string& next_b = options.config.graphics_backend;
+                    if (next_b == "software") {
+                        options.graphics_backend = GraphicsBackendChoice::Software;
+                        options.start_in_software_renderer = true;
+                    } else if (next_b == "opengl") {
+                        options.graphics_backend = GraphicsBackendChoice::Opengl;
+                        options.start_in_software_renderer = false;
+                    } else if (next_b == "vulkan") {
+                        options.graphics_backend = GraphicsBackendChoice::Vulkan;
+                        options.start_in_software_renderer = false;
+                    }
+                    relaunch_backend = true;
+                    running          = false;
+                } else if (machine_any == nullptr && list_inputs() != list_inputs_at_open) {
+                    show_picker();
+                }
             }
             settings_was_visible = gui.visible();
             // Always finalise the ImGui frame (Render must follow NewFrame).
             gui.end_frame();
-            backend->draw_overlay(gui_active);
+            backend->draw_overlay(gui_active || show_touch_ui);
 
             bool end_frame_ok = false;
             {
@@ -3202,8 +3727,16 @@ int main(int argc, char** argv)
 
                 std::optional<LoadedMachine> chosen;
                 rom::LoadError               load_error;
-                if (const std::optional<std::filesystem::path> archive =
-                        find_set_archive(database, options.config, *pick)) {
+                const std::filesystem::path  pick_path(*pick);
+                std::error_code              pick_ec;
+                const bool is_direct_archive = pick_path.has_extension()
+                                            && std::filesystem::is_regular_file(pick_path, pick_ec);
+                if (is_direct_archive) {
+                    chosen = load_game(database, pick_path.string(), {},
+                                       options.config.nvram_dir, options.log_unmapped,
+                                       &load_error);
+                } else if (const std::optional<std::filesystem::path> archive =
+                               find_set_archive(database, options.config, *pick)) {
                     chosen = load_game(database, archive->string(), *pick,
                                        options.config.nvram_dir, options.log_unmapped,
                                        &load_error);
@@ -3213,8 +3746,11 @@ int main(int argc, char** argv)
                 if (!chosen.has_value()) {
                     SM2_ERROR("picker: could not load '%s' from its ROM folder", pick->c_str());
                     show_picker();
-                    const rom::GameSpec* spec = database.find(*pick);
-                    gui.show_load_error(spec != nullptr ? spec->title : *pick,
+                    const rom::GameSpec* spec = is_direct_archive
+                                                  ? (!load_error.game.empty() ? database.find(load_error.game) : nullptr)
+                                                  : database.find(*pick);
+                    gui.show_load_error(spec != nullptr ? spec->title
+                                                        : (is_direct_archive ? pick_path.filename().string() : *pick),
                                         std::move(load_error.message),
                                         std::move(load_error.missing));
                 } else {
@@ -3519,13 +4055,13 @@ int main(int argc, char** argv)
 
         // After wait_idle, so the readback buffer holds a completed copy. A series
         // has already written each of its frames as it went.
-        if (!options.screenshot.empty() && options.screenshot_interval == 0
+        if (!relaunch_backend && !options.screenshot.empty() && options.screenshot_interval == 0
             && options.screenshot_frames.empty() && exit_code == 0
             && !backend->save_capture(options.screenshot)) {
             exit_code = 1;
         }
 
-        if (!options.dump_audio.empty() && sound_board != nullptr
+        if (!relaunch_backend && !options.dump_audio.empty() && sound_board != nullptr
             && !hw::write_wav(options.dump_audio, recorded_audio,
                               sound_board->sample_rate())) {
             exit_code = 1;
@@ -3544,6 +4080,13 @@ int main(int argc, char** argv)
         backend->shutdown_overlay();
         gui.shutdown();
         backend->shutdown();
+
+        if (!relaunch_backend) {
+            break;
+        }
+        SM2_INFO("relaunching renderer as '%s'...",
+                 options.config.graphics_backend.empty()
+                     ? "default" : options.config.graphics_backend.c_str());
     }
 
     SDL_Quit();
