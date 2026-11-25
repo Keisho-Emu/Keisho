@@ -325,9 +325,13 @@ by default.
 
 Most settings are in the settings menu (`F10`) and in `keisho.ini`, which is
 created on first run. The file is looked for in the working directory, then in
-the config folder (`$XDG_CONFIG_HOME/keisho` on Linux,
-`~/Library/Application Support/Keisho` on macOS); `--config <dir>` overrides
-both. Menu changes are saved on exit, and command-line options always win.
+the config folder (`%APPDATA%\keisho` on Windows, `$XDG_CONFIG_HOME/keisho` on
+Linux, `~/Library/Application Support/Keisho` on macOS); `--config <dir>`
+overrides both. Menu changes are saved on exit, and command-line options always
+win.
+
+On Windows, diagnostic logs are written to `keisho.log` beside `keisho.ini` by
+default (`--log-file <file>` chooses a custom path).
 
 ### Language
 

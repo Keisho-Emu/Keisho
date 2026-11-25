@@ -327,9 +327,9 @@ jobs:
       - name: Smoke test
         run: |
           $exe = "keisho-${{ env.VERSION }}-windows-x86_64\keisho.exe"
-          & $exe --help
+          & $exe --help | Out-Host
           if ($LASTEXITCODE -ne 0) { throw "keisho --help exited $LASTEXITCODE" }
-          & $exe --list-games
+          & $exe --list-games | Out-Host
           if ($LASTEXITCODE -ne 0) { throw "keisho --list-games exited $LASTEXITCODE" }
 
       - name: Build zip
